@@ -421,6 +421,13 @@ def _claim_import(source_id: int, file_info: RemoteFileInfo) -> tuple[int, str, 
         return int(row.id), source_type, bool(source.delete_after_import)
 
 
+def _safe_import_failure(exc: Exception) -> str:
+    """Never persist raw remote client exception strings in a user-facing row."""
+    category = "".join(c for c in type(exc).__name__ if c in
+                       "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_")[:64]
+    return f"Watch file import failed ({category or 'Error'}); check service logs"
+
+
 def import_single_file(
     source_id: int,
     file_info: RemoteFileInfo,
@@ -484,13 +491,15 @@ def import_single_file(
             try:
                 client.delete_file(file_info.path)  # type: ignore[attr-defined]
             except Exception as e:  # noqa: BLE001
-                logger.warning("delete_after_import failed for %s: %s", file_info.path, e)
+                logger.warning("delete_after_import failed for source %s: %s",
+                               source_id, type(e).__name__)
 
         return status
 
     except Exception as e:  # noqa: BLE001 - one bad file must not abort the whole scan
-        logger.error("Watch import failed for %s: %s", file_info.path, e, exc_info=True)
-        _record_error(source_id, file_info.path, str(e))
+        logger.error("Watch import failed for source %s: %s", source_id,
+                     type(e).__name__)
+        _record_error(source_id, file_info.path, _safe_import_failure(e))
         return "error"
     finally:
         if temp_path and os.path.exists(temp_path):
@@ -581,4 +590,5 @@ def _record_error(source_id: int, remote_path: str, message: str) -> None:
                 row.retry_count = (row.retry_count or 0) + 1
                 row.processed_at = datetime.now(UTC)
     except Exception as e:  # noqa: BLE001
-        logger.error("Failed to record watch import error for %s: %s", remote_path, e)
+        logger.error("Failed to record watch import error for source %s: %s",
+                     source_id, type(e).__name__)
