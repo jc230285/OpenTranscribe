@@ -100,6 +100,38 @@ def scan_all(self) -> dict:
     return summary
 
 
+def _safe_scan_failure(stage: str, exc: Exception) -> str:
+    """Bounded source/UI error; never persist exception text or remote URLs.
+
+    Some S3, HTTP, broker and auth clients interpolate endpoint URL/query,
+    signed request details, or credentials into exception str().
+    """
+    # Class names are useful to operators but may be dynamically supplied.
+    typename = "".join(c for c in type(exc).__name__ if c in
+                       "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_")[:64]
+    return f"Watch scan {stage} failed ({typename or 'Error'}); check service logs"
+
+
+def _scan_outcome(summary: dict) -> tuple[str, str]:
+    """File-level failures must not leave the source falsely green.
+
+    Some import errors are recorded in summary["errors"] without raising out
+    of _perform_scan, so "finished listing files" is NOT "all imports passed".
+    Keep the bounded existing counters without embedding filenames, exception
+    strings, URLs or credentials in the user-facing scan message.
+    """
+    errors = int(summary.get("errors", 0))
+    status = "error" if errors else "success"
+    message = (
+        f"Found {int(summary.get('found', 0))}, "
+        f"imported {int(summary.get('imported', 0))}, "
+        f"skipped {int(summary.get('skipped', 0))}"
+    )
+    if errors:
+        message += f", errors {errors}"
+    return status, message
+
+
 # --------------------------------------------------------------------------- #
 # Per-source scan
 # --------------------------------------------------------------------------- #
@@ -135,7 +167,8 @@ def scan_single(self, source_id: int) -> dict:
         try:
             plan = _load_scan_plan(source_id)
         except Exception as e:  # noqa: BLE001 - record and continue
-            logger.error("Watch scan setup failed for source %s: %s", source_id, e, exc_info=True)
+            logger.error("Watch scan setup failed for source %s: %s", source_id,
+                         type(e).__name__)
             summary["errors"] += 1
             _record_scan_result(
                 source_id,
@@ -143,7 +176,7 @@ def scan_single(self, source_id: int) -> dict:
                 scan_started,
                 round(time.perf_counter() - start_perf, 2),
                 "error",
-                str(e)[:1000],
+                _safe_scan_failure("setup", e),
             )
             return summary
 
@@ -155,15 +188,12 @@ def scan_single(self, source_id: int) -> dict:
         try:
             with plan["client"] as client:
                 _perform_scan(source_id, plan, client, summary, scan_started)
-            status = "success"
-            message = (
-                f"Found {summary['found']}, imported {summary['imported']}, "
-                f"skipped {summary['skipped']}"
-            )
+            status, message = _scan_outcome(summary)
         except Exception as e:  # noqa: BLE001 - record and continue
-            logger.error("Watch scan failed for source %s: %s", source_id, e, exc_info=True)
+            logger.error("Watch scan failed for source %s: %s", source_id,
+                         type(e).__name__)
             status = "error"
-            message = str(e)[:1000]
+            message = _safe_scan_failure("transport", e)
             summary["errors"] += 1
 
         # Phase 3 — write (short session).
@@ -540,12 +570,14 @@ def stitch_and_import(
                 try:
                     client.upload_file(stitched_path, stitched_remote)
                 except Exception as e:  # noqa: BLE001
-                    logger.warning("upload_stitched_to_source failed: %s", e)
+                    logger.warning("upload_stitched_to_source failed for source %s: %s",
+                                   source_id, type(e).__name__)
 
         return {"status": result_status, "stitched": stitched_name}
     except Exception as e:  # noqa: BLE001
-        logger.error("stitch_and_import failed for source %s group %s: %s", source_id, base_name, e)
-        return {"status": "error", "error": str(e)}
+        logger.error("stitch_and_import failed for source %s: %s", source_id,
+                     type(e).__name__)
+        return {"status": "error", "error": _safe_scan_failure("stitch", e)}
     finally:
         if stitched_path and os.path.exists(stitched_path):
             with contextlib.suppress(OSError):
